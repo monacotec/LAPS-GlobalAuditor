@@ -1,0 +1,16 @@
+# Logs and output
+*.log
+*.xlsx
+*.csv
+
+# PowerShell
+*.psm1.bak
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
