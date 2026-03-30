@@ -8,11 +8,8 @@
 .DESCRIPTION
     Connects to Microsoft Graph, retrieves all hybrid Azure AD joined devices,
     checks each for a Local Administrator Password Solution (LAPS) credential,
-    and reports devices that are missing one.
-
-.PARAMETER IncludeStaleDevices
-    Include devices that haven't signed in within the last 90 days.
-    By default, stale devices are excluded.
+    and reports devices that are missing one. Active and stale devices are always
+    included but reported in separate sections and Excel sheets.
 
 .PARAMETER StaleDaysThreshold
     Number of days since last sign-in to consider a device stale. Default: 90.
@@ -21,13 +18,11 @@
     .\Get-DevicesWithoutLAPS.ps1
 
 .EXAMPLE
-    .\Get-DevicesWithoutLAPS.ps1 -IncludeStaleDevices -StaleDaysThreshold 180
+    .\Get-DevicesWithoutLAPS.ps1 -StaleDaysThreshold 180
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$IncludeStaleDevices,
-
     [int]$StaleDaysThreshold = 90
 )
 
@@ -39,8 +34,8 @@ if (-not (Test-Path $logDir)) {
     New-Item -Path $logDir -ItemType Directory -Force | Out-Null
 }
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$logFile = Join-Path $logDir "LAPSAudit_$timestamp.log"
-$transcriptFile = Join-Path $logDir "LAPSAudit_$timestamp_transcript.log"
+$logFile        = Join-Path $logDir "LAPSAudit_${timestamp}.log"
+$transcriptFile = Join-Path $logDir "LAPSAudit_${timestamp}_transcript.log"
 
 function Write-Log {
     param(
@@ -59,6 +54,7 @@ function Write-Log {
 
 Start-Transcript -Path $transcriptFile -Append | Out-Null
 Write-Log "Script started. Log file: $logFile"
+Write-Log "Stale threshold: $StaleDaysThreshold days"
 
 # --- Connect to Graph ---
 $requiredScopes = @(
@@ -96,9 +92,9 @@ $filter = "trustType eq 'ServerAd'"
 $select = "id,displayName,deviceId,operatingSystem,operatingSystemVersion,approximateLastSignInDateTime,accountEnabled,trustType"
 
 try {
-    $devices = Get-MgDevice -Filter $filter -Property $select -All -CountVariable deviceCount `
+    $allDevices = Get-MgDevice -Filter $filter -Property $select -All -CountVariable deviceCount `
         -ConsistencyLevel eventual
-    Write-Log "Found $($devices.Count) hybrid-joined device(s)."
+    Write-Log "Found $($allDevices.Count) hybrid-joined device(s)."
 }
 catch {
     Write-Log "Failed to retrieve devices: $_" -Level ERROR
@@ -106,103 +102,152 @@ catch {
     return
 }
 
-if ($devices.Count -eq 0) {
+if ($allDevices.Count -eq 0) {
     Write-Log "No hybrid-joined devices found in this tenant." -Level WARN
     Stop-Transcript | Out-Null
     return
 }
 
-# --- Filter stale devices ---
-$staleCount = 0
-if (-not $IncludeStaleDevices) {
-    $cutoffDate = (Get-Date).AddDays(-$StaleDaysThreshold)
-    $activeDevices = $devices | Where-Object {
-        $_.ApproximateLastSignInDateTime -and
-        $_.ApproximateLastSignInDateTime -gt $cutoffDate
-    }
-    $staleCount = $devices.Count - $activeDevices.Count
-    if ($staleCount -gt 0) {
-        Write-Log "Excluded $staleCount stale device(s) (no sign-in in $StaleDaysThreshold days). Use -IncludeStaleDevices to include them." -Level WARN
-    }
-    $devices = $activeDevices
+# --- Partition into active and stale ---
+$cutoffDate    = (Get-Date).AddDays(-$StaleDaysThreshold)
+$activeDevices = $allDevices | Where-Object {
+    $_.ApproximateLastSignInDateTime -and $_.ApproximateLastSignInDateTime -gt $cutoffDate
+}
+$staleDevices  = $allDevices | Where-Object {
+    -not $_.ApproximateLastSignInDateTime -or $_.ApproximateLastSignInDateTime -le $cutoffDate
 }
 
-# --- Check each device for LAPS credential ---
-Write-Log "Checking LAPS status for $($devices.Count) device(s)..."
+Write-Log "Active devices (signed in within $StaleDaysThreshold days) : $($activeDevices.Count)"
+Write-Log "Stale  devices (no sign-in in $StaleDaysThreshold+ days)   : $($staleDevices.Count)"
 
-$results = [System.Collections.Generic.List[PSCustomObject]]::new()
-$counter = 0
+# --- Helper: check LAPS for a list of devices ---
+function Get-DevicesWithoutLapsCredential {
+    param(
+        [object[]]$DeviceList,
+        [string]$GroupLabel
+    )
 
-foreach ($device in $devices) {
-    $counter++
-    $pct = [math]::Round(($counter / $devices.Count) * 100)
-    Write-Progress -Activity "Checking LAPS credentials" -Status "$counter / $($devices.Count) ($pct%)" `
-        -PercentComplete $pct -CurrentOperation $device.DisplayName
+    $missing  = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $counter  = 0
+    $total    = $DeviceList.Count
 
-    $hasLaps = $false
-    try {
-        # Query the LAPS credential for this device by its deviceId
-        $lapsCredential = Get-MgDeviceLocalCredential -Filter "deviceId eq '$($device.DeviceId)'" -ErrorAction Stop
-        if ($lapsCredential) {
-            $hasLaps = $true
-        }
-    }
-    catch {
-        # 404 or empty result means no LAPS credential
+    foreach ($device in $DeviceList) {
+        $counter++
+        $pct = [math]::Round(($counter / $total) * 100)
+        Write-Progress -Activity "Checking LAPS credentials ($GroupLabel)" `
+            -Status "$counter / $total ($pct%)" `
+            -PercentComplete $pct `
+            -CurrentOperation $device.DisplayName
+
         $hasLaps = $false
+        try {
+            $lapsCredential = Get-MgDeviceLocalCredential -Filter "deviceId eq '$($device.DeviceId)'" -ErrorAction Stop
+            if ($lapsCredential) { $hasLaps = $true }
+        }
+        catch {
+            $hasLaps = $false
+        }
+
+        if (-not $hasLaps) {
+            $missing.Add([PSCustomObject]@{
+                DeviceName = $device.DisplayName
+                DeviceId   = $device.DeviceId
+                ObjectId   = $device.Id
+                OS         = $device.OperatingSystem
+                OSVersion  = $device.OperatingSystemVersion
+                Enabled    = $device.AccountEnabled
+                LastSignIn = $device.ApproximateLastSignInDateTime
+                TrustType  = $device.TrustType
+            })
+        }
     }
 
-    if (-not $hasLaps) {
-        $results.Add([PSCustomObject]@{
-            DeviceName       = $device.DisplayName
-            DeviceId         = $device.DeviceId
-            ObjectId         = $device.Id
-            OS               = $device.OperatingSystem
-            OSVersion        = $device.OperatingSystemVersion
-            Enabled          = $device.AccountEnabled
-            LastSignIn       = $device.ApproximateLastSignInDateTime
-            TrustType        = $device.TrustType
-        })
-    }
+    Write-Progress -Activity "Checking LAPS credentials ($GroupLabel)" -Completed
+    return $missing
 }
 
-Write-Progress -Activity "Checking LAPS credentials" -Completed
+# --- Check active devices ---
+Write-Log "Checking LAPS status for $($activeDevices.Count) active device(s)..."
+$activeResults = if ($activeDevices.Count -gt 0) {
+    Get-DevicesWithoutLapsCredential -DeviceList $activeDevices -GroupLabel 'Active'
+} else {
+    [System.Collections.Generic.List[PSCustomObject]]::new()
+}
 
-# --- Output results ---
+# --- Check stale devices ---
+Write-Log "Checking LAPS status for $($staleDevices.Count) stale device(s)..."
+$staleResults = if ($staleDevices.Count -gt 0) {
+    Get-DevicesWithoutLapsCredential -DeviceList $staleDevices -GroupLabel 'Stale'
+} else {
+    [System.Collections.Generic.List[PSCustomObject]]::new()
+}
+
+# --- Console summary ---
 Write-Log "========== Results =========="
-Write-Log "Total hybrid devices checked : $($devices.Count)"
-Write-Log "Devices WITHOUT LAPS         : $($results.Count)"
-Write-Log "Devices with LAPS            : $($devices.Count - $results.Count)"
+Write-Log "Total hybrid devices         : $($allDevices.Count)"
+Write-Log "  Active checked             : $($activeDevices.Count)"
+Write-Log "  Stale  checked             : $($staleDevices.Count)"
+Write-Log "Active WITHOUT LAPS          : $($activeResults.Count)"
+Write-Log "Stale  WITHOUT LAPS          : $($staleResults.Count)"
+Write-Log "Total  WITHOUT LAPS          : $($activeResults.Count + $staleResults.Count)"
 
-if ($results.Count -gt 0) {
-    Write-Log "Devices missing LAPS password in Entra:" -Level WARN
-    $results | Format-Table -Property DeviceName, OS, OSVersion, Enabled, LastSignIn -AutoSize
+if ($activeResults.Count -gt 0) {
+    Write-Log "--- Active devices missing LAPS ---" -Level WARN
+    $activeResults | Format-Table -Property DeviceName, OS, OSVersion, Enabled, LastSignIn -AutoSize
+}
+else {
+    Write-Log "All active hybrid-joined devices have LAPS credentials in Entra."
+}
 
-    # Export to xlsx
-    $xlsxFile = Join-Path $logDir "LAPSAudit_$timestamp.xlsx"
+if ($staleResults.Count -gt 0) {
+    Write-Log "--- Stale devices missing LAPS (no sign-in in $StaleDaysThreshold+ days) ---" -Level WARN
+    $staleResults | Format-Table -Property DeviceName, OS, OSVersion, Enabled, LastSignIn -AutoSize
+}
+else {
+    Write-Log "All stale hybrid-joined devices have LAPS credentials in Entra."
+}
+
+# --- Export to xlsx ---
+$totalWithoutLaps = $activeResults.Count + $staleResults.Count
+if ($totalWithoutLaps -gt 0) {
+    $xlsxFile = Join-Path $logDir "LAPSAudit_${timestamp}.xlsx"
     try {
-        $excelParams = @{
-            Path          = $xlsxFile
-            WorksheetName = 'Devices Without LAPS'
-            AutoSize      = $true
-            AutoFilter    = $true
-            FreezeTopRow  = $true
-            BoldTopRow    = $true
-            TableStyle    = 'Medium6'
-            Title         = "LAPS Audit - Devices Without Entra LAPS"
-            TitleBold     = $true
+        $baseExcelParams = @{
+            Path         = $xlsxFile
+            AutoSize     = $true
+            AutoFilter   = $true
+            FreezeTopRow = $true
+            BoldTopRow   = $true
+            TableStyle   = 'Medium6'
         }
-        $results | Export-Excel @excelParams
 
-        # Add a summary sheet
+        if ($activeResults.Count -gt 0) {
+            $activeResults | Export-Excel @baseExcelParams `
+                -WorksheetName 'Active Without LAPS' `
+                -Title         'LAPS Audit - Active Devices Without Entra LAPS' `
+                -TitleBold     $true
+        }
+
+        if ($staleResults.Count -gt 0) {
+            $staleResults | Export-Excel @baseExcelParams `
+                -WorksheetName 'Stale Without LAPS' `
+                -Title         "LAPS Audit - Stale Devices Without Entra LAPS (>${StaleDaysThreshold}d)" `
+                -TitleBold     $true
+        }
+
+        # Summary sheet
         $summary = [PSCustomObject]@{
-            'Report Date'              = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-            'Tenant ID'                = (Get-MgContext).TenantId
-            'Total Hybrid Devices'     = $devices.Count
-            'Devices Without LAPS'     = $results.Count
-            'Devices With LAPS'        = $devices.Count - $results.Count
-            'Stale Devices Excluded'   = if ($IncludeStaleDevices) { 'N/A' } else { $staleCount }
-            'Stale Threshold (Days)'   = $StaleDaysThreshold
+            'Report Date'                    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            'Tenant ID'                      = (Get-MgContext).TenantId
+            'Stale Threshold (Days)'         = $StaleDaysThreshold
+            'Total Hybrid Devices'           = $allDevices.Count
+            'Active Devices'                 = $activeDevices.Count
+            'Stale Devices'                  = $staleDevices.Count
+            'Active Without LAPS'            = $activeResults.Count
+            'Stale Without LAPS'             = $staleResults.Count
+            'Total Without LAPS'             = $totalWithoutLaps
+            'Active With LAPS'               = $activeDevices.Count - $activeResults.Count
+            'Stale With LAPS'                = $staleDevices.Count  - $staleResults.Count
         }
         $summary | Export-Excel -Path $xlsxFile -WorksheetName 'Summary' -AutoSize -BoldTopRow
 
@@ -213,11 +258,14 @@ if ($results.Count -gt 0) {
     }
 }
 else {
-    Write-Log "All hybrid-joined devices have LAPS credentials in Entra."
+    Write-Log "All hybrid-joined devices (active and stale) have LAPS credentials in Entra."
 }
 
 Stop-Transcript | Out-Null
 Write-Log "Script complete. Transcript: $transcriptFile"
 
-# Return objects to the pipeline for further processing
-$results
+# Return both result sets to the pipeline
+[PSCustomObject]@{
+    ActiveWithoutLAPS = $activeResults
+    StaleWithoutLAPS  = $staleResults
+}
