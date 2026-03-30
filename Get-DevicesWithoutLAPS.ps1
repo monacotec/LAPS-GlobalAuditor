@@ -225,14 +225,14 @@ if ($totalWithoutLaps -gt 0) {
             $activeResults | Export-Excel @baseExcelParams `
                 -WorksheetName 'Active Without LAPS' `
                 -Title         'LAPS Audit - Active Devices Without Entra LAPS' `
-                -TitleBold     $true
+                -TitleBold
         }
 
         if ($staleResults.Count -gt 0) {
             $staleResults | Export-Excel @baseExcelParams `
                 -WorksheetName 'Stale Without LAPS' `
                 -Title         "LAPS Audit - Stale Devices Without Entra LAPS (>${StaleDaysThreshold}d)" `
-                -TitleBold     $true
+                -TitleBold
         }
 
         # Summary sheet
